@@ -1,0 +1,464 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <AudioTools.h>
+#include <AudioTools/AudioCodecs/CodecMP3Helix.h>
+#include <esp_heap_caps.h>
+#include <HCSR04.h>
+#include <ArduinoJson.h>
+#include <vector>
+#include <driver/i2s.h>
+#include "../config.h"
+
+// Pin Definitions
+#define I2S_BCLK 42
+#define I2S_WS 41
+#define I2S_DIN 7
+#define I2S_DOUT 6
+#define TRIG_PIN 10
+#define ECHO_PIN 11
+#define SERVO_PIN 9
+#define MIC_POWER_PIN 8
+
+audio_tools::AudioInfo micInfo(16000, 1, 16);
+audio_tools::AudioInfo speakerInfo(16000, 2, 16);
+audio_tools::I2SStream i2s;
+
+UltraSonicDistanceSensor distanceSensor(TRIG_PIN, ECHO_PIN);
+
+#define DEBUG_PRINT(x) Serial.printf("[%lu] %s\n", millis(), x)
+
+String p1 = "You are Lexi, the smart AI assistant in the Department of Computer Science. ";
+String p2 = "You are helping others when the head of the department(hod) is not available. ";
+String p3 = "You assist visitors with their needs, gather and remember their context, and keep track of all interactions. ";
+String p4 = "When the department head returns, you report everything you did and all visitor details in very briefly. ";
+String p5 = "You can detect when the department head is present or absent. If you hear the phrase 'Lexi it's me I am available now', you know the department head is present. ";
+String p6 = "Always be polite, approachable, and clear, while maintaining a professional tone.";
+
+String personality = p1 + p2 + p3 + p4 + p5 + p6;
+
+// Conversation History
+struct Message {
+  String role;
+  String content;
+};
+std::vector<Message, PSRAMAllocator<Message>> conversationHistory;
+
+// Function prototypes
+void playTTS(String text);
+String recordAndSTT();
+String getAIResponse(String input);
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(MIC_POWER_PIN, OUTPUT);
+  digitalWrite(MIC_POWER_PIN, HIGH);
+  delay(100);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    DEBUG_PRINT("Connecting to WiFi...");
+  }
+  DEBUG_PRINT("WiFi Connected");
+
+  auto config = i2s.defaultConfig(TX_MODE);
+  config.sample_rate = 16000;
+  config.channels = 1;
+  config.bits_per_sample = 16;
+  config.pin_bck = I2S_BCLK;
+  config.pin_ws = I2S_WS;
+  config.pin_data = I2S_DOUT;
+  config.pin_data_rx = I2S_DIN;
+  config.use_apll = false;
+  config.i2s_format = I2S_STD_FORMAT;
+  config.buffer_count = 6;
+  config.buffer_size = 256;
+  i2s.begin(config);
+
+  // servo.attach(SERVO_PIN);
+  // servo.write(0);
+
+  // Initialize conversation history with system prompt
+  conversationHistory.push_back({"system", personality});
+
+  DEBUG_PRINT("Setup complete. Ready for voice recording test.");
+}
+
+void loop() {
+  static enum { WAIT, COUNTDOWN, RECORD, PROCESS, NEXT } convState = WAIT;
+  static unsigned long stateStart = 0;
+  static int countdown = 1;
+  static String userInput = "";
+  static String aiResponse = "";
+
+  float distance = distanceSensor.measureDistanceCm();
+
+  switch (convState) {
+  case WAIT:
+    if (distance > 0 && distance < 100) {
+      DEBUG_PRINT("Person detected within 1m. Starting conversation...");
+      stateStart = millis();
+      convState = COUNTDOWN;
+      countdown = 1;
+    } else {
+      DEBUG_PRINT("Waiting for person within 2m...");
+      delay(200);
+    }
+    break;
+
+  case COUNTDOWN:
+    if (millis() - stateStart >= 1000) {
+      DEBUG_PRINT(("Countdown: " + String(countdown)).c_str());
+      countdown--;
+      stateStart = millis();
+    }
+    if (countdown <= 0) {
+      DEBUG_PRINT("Recording now! Speak for 5 seconds...");
+      convState = RECORD;
+      stateStart = millis();
+    }
+    break;
+
+  case RECORD:
+    userInput = recordAndSTT();
+    DEBUG_PRINT(("Transcribed text: " + userInput).c_str());
+    convState = PROCESS;
+    break;
+
+  case PROCESS:
+    if (userInput.length() > 0) {
+      DEBUG_PRINT("Getting AI response...");
+      aiResponse = getAIResponse(userInput);
+      DEBUG_PRINT(("AI Response: " + aiResponse).c_str());
+
+      // Check for HOD presence
+      if (userInput.indexOf("Lexi it's me I am available now") >= 0) {
+        String report = "HOD has returned. Summary of interactions:\n";
+        for (size_t i = 1; i < conversationHistory.size(); i++) { // Skip system prompt
+          if (conversationHistory[i].role == "user") {
+            report += "Visitor asked: " + conversationHistory[i].content + "\n";
+          } else if (conversationHistory[i].role == "assistant") {
+            report += "Lexi responded: " + conversationHistory[i].content + "\n";
+          }
+        }
+        DEBUG_PRINT(("HOD Report: " + report).c_str());
+        playTTS("Welcome back, HOD. I have prepared a summary of all interactions.");
+        playTTS(report);
+        conversationHistory.clear();
+        conversationHistory.push_back({"system", personality});
+        convState = WAIT;
+        break;
+      }
+
+      DEBUG_PRINT("Playing TTS response...");
+      playTTS(aiResponse);
+    } else {
+      DEBUG_PRINT("No speech detected or transcription failed.");
+    }
+    convState = NEXT;
+    stateStart = millis();
+    break;
+
+  case NEXT:
+    if (millis() - stateStart > 1000) {
+      convState = WAIT;
+    }
+    break;
+  }
+}
+
+// Record Audio and Send to STT (OpenAI Whisper API)
+String recordAndSTT() {
+  DEBUG_PRINT("Starting audio recording...");
+  i2s.end();
+
+  const i2s_config_t i2s_config = {
+    .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = 16000,
+    .bits_per_sample = i2s_bits_per_sample_t(16),
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_STAND_I2S),
+    .intr_alloc_flags = 0,
+    .dma_buf_count = 8,
+    .dma_buf_len = 64,
+    .use_apll = false
+  };
+
+  const i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_BCLK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = -1,
+    .data_in_num = I2S_DIN
+  };
+
+  esp_err_t err = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  if (err != ESP_OK) {
+    DEBUG_PRINT(("I2S driver install failed: " + String(err)).c_str());
+    return "";
+  }
+
+  err = i2s_set_pin(I2S_NUM_0, &pin_config);
+  if (err != ESP_OK) {
+    DEBUG_PRINT(("I2S pin config failed: " + String(err)).c_str());
+    i2s_driver_uninstall(I2S_NUM_0);
+    return "";
+  }
+
+  err = i2s_start(I2S_NUM_0);
+  if (err != ESP_OK) {
+    DEBUG_PRINT(("I2S start failed: " + String(err)).c_str());
+    i2s_driver_uninstall(I2S_NUM_0);
+    return "";
+  }
+
+  delay(100);
+
+  const int bufferLen = 64;
+  int16_t sBuffer[bufferLen];
+  std::vector<int16_t> samples;
+
+  int totalSamples = 16000 * 2.5;  //seconds of recording
+  int samplesRead = 0;
+
+  while (samplesRead < totalSamples) {
+    size_t bytesIn = 0;
+    esp_err_t result = i2s_read(I2S_NUM_0, &sBuffer, bufferLen * sizeof(int16_t), &bytesIn, portMAX_DELAY);
+
+    if (result == ESP_OK && bytesIn > 0) {
+      int samplesInBuffer = bytesIn / sizeof(int16_t);
+      for (int i = 0; i < samplesInBuffer && samplesRead < totalSamples; i++) {
+        samples.push_back(sBuffer[i]);
+        samplesRead++;
+      }
+    }
+  }
+
+  i2s_stop(I2S_NUM_0);
+  i2s_driver_uninstall(I2S_NUM_0);
+
+  // --- WAV FILE CREATION IN MEMORY ---
+  uint32_t dataSize = samples.size() * sizeof(int16_t);
+  uint32_t fileSize = 44 + dataSize;
+  std::vector<uint8_t> wavData;
+  wavData.reserve(fileSize);
+
+  // WAV header (PCM, mono, 16-bit, 16kHz)
+  uint8_t wavHeader[44] = {
+    'R','I','F','F',
+    (uint8_t)(fileSize-8), (uint8_t)((fileSize-8)>>8), (uint8_t)((fileSize-8)>>16), (uint8_t)((fileSize-8)>>24),
+    'W','A','V','E',
+    'f','m','t',' ',
+    16,0,0,0,
+    1,0,
+    1,0,
+    0x80,0x3E,0,0,
+    0x00,0x7D,0,0,
+    2,0,
+    16,0,
+    'd','a','t','a',
+    (uint8_t)(dataSize), (uint8_t)(dataSize>>8), (uint8_t)(dataSize>>16), (uint8_t)(dataSize>>24)
+  };
+
+  wavData.insert(wavData.end(), wavHeader, wavHeader + 44);
+  wavData.insert(wavData.end(), (uint8_t*)samples.data(), (uint8_t*)samples.data() + dataSize);
+
+  // Restart I2S for speaker output
+  auto config = i2s.defaultConfig(TX_MODE);
+  config.sample_rate = 16000;
+  config.channels = 2;
+  config.bits_per_sample = 16;
+  config.pin_bck = I2S_BCLK;
+  config.pin_ws = I2S_WS;
+  config.pin_data = I2S_DOUT;
+  config.use_apll = false;
+  config.i2s_format = I2S_STD_FORMAT;
+  config.buffer_count = 6;
+  config.buffer_size = 256;
+  i2s.begin(config);
+
+  // Prepare multipart/form-data payload for Whisper API
+  String boundary = "----WebKitFormBoundary7MA4YWkTrZu0gW";
+  std::vector<uint8_t> fullPayload;
+
+  auto addStringToPayload = [&](const String& s) {
+    fullPayload.insert(fullPayload.end(), (uint8_t*)s.c_str(), (uint8_t*)s.c_str() + s.length());
+  };
+
+  addStringToPayload("--" + boundary + "\r\n");
+  addStringToPayload("Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n");
+  addStringToPayload("Content-Type: audio/wav\r\n\r\n");
+  fullPayload.insert(fullPayload.end(), wavData.begin(), wavData.end());
+  addStringToPayload("\r\n--" + boundary + "\r\n");
+  addStringToPayload("Content-Disposition: form-data; name=\"model\"\r\n\r\n");
+  addStringToPayload("whisper-1\r\n");
+  addStringToPayload("--" + boundary + "--\r\n");
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.begin(client, "https://api.openai.com/v1/audio/transcriptions");
+  http.addHeader("Authorization", "Bearer " + String(OPENAI_API_KEY));
+  http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+  http.setTimeout(30000);
+
+  int httpCode = http.POST(fullPayload.data(), fullPayload.size());
+  if (httpCode == HTTP_CODE_OK) {
+    String response = http.getString();
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, response);
+
+    if (error) {
+      DEBUG_PRINT(("JSON Parse Error: " + String(error.c_str())).c_str());
+      return "";
+    }
+
+    if (doc["text"].is<String>()) {
+      return doc["text"].as<String>();
+    } else {
+      DEBUG_PRINT("No 'text' field in API response");
+      return "";
+    }
+  } else {
+    DEBUG_PRINT(("STT API Error: HTTP " + String(httpCode) + " - " + http.errorToString(httpCode)).c_str());
+    if (httpCode > 0) {
+      DEBUG_PRINT(("Error Response: " + http.getString()).c_str());
+    }
+    return "";
+  }
+}
+
+// Helper allocator for PSRAM
+template<typename T>
+struct PSRAMAllocator {
+  typedef T value_type;
+  PSRAMAllocator() noexcept {}
+  template <class U> PSRAMAllocator(const PSRAMAllocator<U>&) noexcept {}
+  T* allocate(std::size_t n) {
+    return static_cast<T*>(heap_caps_malloc(n * sizeof(T), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  }
+  void deallocate(T* p, std::size_t) noexcept { heap_caps_free(p); }
+};
+
+// Play TTS Audio (buffered in PSRAM)
+void playTTS(String text) {
+  auto config = i2s.defaultConfig(TX_MODE);
+  config.sample_rate = 16000;
+  config.channels = 2;
+  config.bits_per_sample = 16;
+  config.pin_bck = I2S_BCLK;
+  config.pin_ws = I2S_WS;
+  config.pin_data = I2S_DOUT;
+  config.use_apll = false;
+  config.i2s_format = I2S_STD_FORMAT;
+  config.buffer_count = 6;
+  config.buffer_size = 256;
+  i2s.begin(config);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.begin(client, "https://api.elevenlabs.io/v1/text-to-speech/cgSgspJ2msm6clMCkdW9/stream");
+  http.addHeader("xi-api-key", ELEVENLABS_API_KEY);
+  http.addHeader("Content-Type", "application/json");
+  String payload = "{\"text\":\"" + text + "\", \"model_id\":\"eleven_monolingual_v1\", \"voice_settings\":{\"speed\":0.7, \"stability\":0.7, \"similarity_boost\":0.75}}";
+  int httpCode = http.POST(payload);
+
+  if (httpCode == HTTP_CODE_OK) {
+    std::vector<uint8_t, PSRAMAllocator<uint8_t>> mp3Buffer;
+    WiFiClient* stream = http.getStreamPtr();
+    uint8_t temp[1024];
+    int totalRead = 0;
+    unsigned long startTime = millis();
+    const unsigned long timeout = 4000; // 4 seconds max buffering
+
+    while ((stream->connected() || stream->available()) && (millis() - startTime < timeout)) {
+      int len = stream->available();
+      if (len > 0) {
+        int readLen = stream->read(temp, sizeof(temp));
+        if (readLen > 0) {
+          mp3Buffer.insert(mp3Buffer.end(), temp, temp + readLen);
+          totalRead += readLen;
+          startTime = millis(); // reset timeout on data
+        }
+      } else {
+        delay(10);
+      }
+    }
+    DEBUG_PRINT(("Buffered MP3 size: " + String(totalRead)).c_str());
+
+    if (mp3Buffer.size() > 0) {
+      audio_tools::MP3DecoderHelix decoder;
+      audio_tools::EncodedAudioStream audioStream(&i2s, &decoder);
+      audioStream.begin(speakerInfo);
+
+      size_t offset = 0;
+      while (offset < mp3Buffer.size()) {
+        size_t chunk = std::min<size_t>(1024, mp3Buffer.size() - offset);
+        audioStream.write(mp3Buffer.data() + offset, chunk);
+        offset += chunk;
+      }
+      audioStream.end();
+      delay(500);
+    } else {
+      DEBUG_PRINT("No MP3 data received from ElevenLabs.");
+    }
+  } else {
+    DEBUG_PRINT(("TTS Error: " + String(httpCode) + " - " + http.errorToString(httpCode)).c_str());
+  }
+  http.end();
+  i2s.end();
+}
+
+// Get AI Response (OpenAI Chat API with conversation history)
+String getAIResponse(String input) {
+  if (input.length() > 0) {
+    conversationHistory.push_back({"user", input});
+  }
+
+  // Limit history to 10 messages to manage memory (excluding system prompt)
+  const size_t maxHistory = 10;
+  while (conversationHistory.size() > maxHistory + 1) {
+    conversationHistory.erase(conversationHistory.begin() + 1); // Keep system prompt
+  }
+
+  // Build messages array for API
+  DynamicJsonDocument doc(2048);
+  JsonArray messages = doc.createNestedArray("messages");
+  for (const auto& msg : conversationHistory) {
+    JsonObject message = messages.createNestedObject();
+    message["role"] = msg.role;
+    message["content"] = msg.content;
+  }
+
+  doc["model"] = "gpt-3.5-turbo";
+
+  String payload;
+  serializeJson(doc, payload);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.begin(client, "https://api.openai.com/v1/chat/completions");
+  http.addHeader("Authorization", "Bearer " + String(OPENAI_API_KEY));
+  http.addHeader("Content-Type", "application/json");
+
+  int httpCode = http.POST(payload);
+  if (httpCode == HTTP_CODE_OK) {
+    JsonDocument responseDoc;
+    deserializeJson(responseDoc, http.getString());
+    String assistantResponse = responseDoc["choices"][0]["message"]["content"].as<String>();
+    
+    if (assistantResponse.length() > 0) {
+      conversationHistory.push_back({"assistant", assistantResponse});
+    }
+    
+    DEBUG_PRINT("AI Response: " + assistantResponse);
+    return assistantResponse;
+  } else {
+    DEBUG_PRINT(("AI Response Error: " + String(httpCode) + " - " + http.errorToString(httpCode)).c_str());
+    return "Sorry, I didn't understand that.";
+  }
+}
